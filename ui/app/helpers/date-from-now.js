@@ -1,5 +1,6 @@
 import { helper } from '@ember/component/helper';
-import { distanceInWordsToNow } from 'date-fns';
+import { formatDistanceToNow } from 'date-fns';
+import parseISO from 'date-fns/parseISO';
 
 export function dateFromNow([date], options = {}) {
   let d = date;

@@ -6,8 +6,10 @@ import (
 	"io/ioutil"
 	"net/url"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	log "github.com/hashicorp/go-hclog"
@@ -17,7 +19,6 @@ import (
 	"github.com/hashicorp/vault/physical/raft"
 	"github.com/hashicorp/vault/sdk/helper/logging"
 	"github.com/hashicorp/vault/sdk/physical"
-	"github.com/hashicorp/vault/vault"
 	"github.com/mitchellh/cli"
 	"github.com/pkg/errors"
 	"github.com/posener/complete"
@@ -37,6 +38,8 @@ type OperatorMigrateCommand struct {
 	flagConfig       string
 	flagStart        string
 	flagReset        bool
+	flagWorkerCount  int
+	flagListKeys     bool
 	logger           log.Logger
 	ShutdownCh       chan struct{}
 }
@@ -45,6 +48,8 @@ type migratorConfig struct {
 	StorageSource      *server.Storage `hcl:"-"`
 	StorageDestination *server.Storage `hcl:"-"`
 	ClusterAddr        string          `hcl:"cluster_addr"`
+	Exclusions         []string        `hcl:"exclusions"`
+	Inclusions         []string        `hcl:"inclusions"`
 }
 
 func (c *OperatorMigrateCommand) Synopsis() string {
@@ -96,6 +101,18 @@ func (c *OperatorMigrateCommand) Flags() *FlagSets {
 		Usage:  "Reset the migration lock. No migration will occur.",
 	})
 
+	f.BoolVar(&BoolVar{
+		Name:   "list",
+		Target: &c.flagListKeys,
+		Usage:  "Only list the keys that will be migrated.",
+	})
+
+	f.IntVar(&IntVar{
+		Name:   "workers",
+		Target: &c.flagWorkerCount,
+		Usage:  "Number of migration workers",
+	})
+
 	return set
 }
 
@@ -114,6 +131,10 @@ func (c *OperatorMigrateCommand) Run(args []string) int {
 	if err := f.Parse(args); err != nil {
 		c.UI.Error(err.Error())
 		return 1
+	}
+
+	if c.flagWorkerCount == 0 {
+		c.flagWorkerCount = 250
 	}
 
 	if c.flagConfig == "" {
@@ -190,7 +211,8 @@ func (c *OperatorMigrateCommand) migrate(config *migratorConfig) error {
 
 	doneCh := make(chan error)
 	go func() {
-		doneCh <- c.migrateAll(ctx, from, to)
+		c.UI.Output("about to begin migration")
+		doneCh <- c.migrateAll(ctx, from, to, config.Exclusions, config.Inclusions)
 	}()
 
 	select {
@@ -206,27 +228,108 @@ func (c *OperatorMigrateCommand) migrate(config *migratorConfig) error {
 }
 
 // migrateAll copies all keys in lexicographic order.
-func (c *OperatorMigrateCommand) migrateAll(ctx context.Context, from physical.Backend, to physical.Backend) error {
-	return dfsScan(ctx, from, func(ctx context.Context, path string) error {
-		if path < c.flagStart || path == storageMigrationLock || path == vault.CoreLockPath {
-			return nil
-		}
+func (c *OperatorMigrateCommand) migrateAll(ctx context.Context, from physical.Backend, to physical.Backend, exclusions, inclusions []string) error {
 
-		entry, err := from.Get(ctx, path)
-		if err != nil {
-			return fmt.Errorf("error reading entry: %w", err)
-		}
+	mutex := &sync.Mutex{}
 
-		if entry == nil {
-			return nil
-		}
+	keys, err := c.buildKeys(ctx, from, exclusions, inclusions)
+	if err != nil {
+		return err
+	}
 
-		if err := to.Put(ctx, entry); err != nil {
-			return fmt.Errorf("error writing entry: %w", err)
+	if c.flagListKeys {
+		for i := range keys {
+			fmt.Println(keys[i])
 		}
-		c.logger.Info("copied key", "path", path)
 		return nil
-	})
+	}
+
+	entryChan := make(chan *physical.Entry)
+	keyChan := make(chan string)
+
+	entries := make([]*physical.Entry, 0)
+
+	for i := 0; i < 2; i++ {
+		go func(i int) {
+			for {
+				select {
+				case <-ctx.Done():
+					c.UI.Output(fmt.Sprintf("shutting down worker %v", i))
+					return
+
+				case key := <-keyChan:
+					c.UI.Output(fmt.Sprintf("getting key %v\n", key))
+					entry, err := from.Get(ctx, key)
+					if err != nil {
+						panic(fmt.Sprintf("error reading entry: %v\n", err))
+					}
+					mutex.Lock()
+					entries = append(entries, entry)
+					mutex.Unlock()
+				}
+			}
+		}(i)
+	}
+
+	for i := range keys {
+		keyChan <- keys[i]
+	}
+
+	// create a pool of migration workers
+	for i := 0; i < c.flagWorkerCount; i++ {
+		go func(i int) {
+			c.UI.Output(fmt.Sprintf("starting worker %v\n", i))
+
+			for {
+				select {
+				case <-ctx.Done():
+					c.UI.Output(fmt.Sprintf("shutting down worker %v", i))
+					return
+				case entry := <-entryChan:
+					if entry != nil {
+						c.UI.Output(fmt.Sprintf("worker(%v) writing %s\n", i, entry.Key))
+						if err := to.Put(ctx, entry); err != nil {
+							c.UI.Error(fmt.Sprintf("error writing entry: %s", err))
+						}
+					}
+				}
+			}
+		}(i)
+	}
+
+	for i := range entries {
+		c.UI.Output(fmt.Sprintf("putting entry %v on queue\n", i))
+		if entries[i] != nil {
+			entryChan <- entries[i]
+		}
+	}
+
+	toKeys, err := c.buildKeys(ctx, to, exclusions, inclusions)
+	if err != nil {
+		return err
+	}
+	c.UI.Output(fmt.Sprintf("source keys count: %v, there are now %v keys in the destination\n", len(keys), len(toKeys)))
+
+	keysMap := make(map[string]struct{})
+	toMap := make(map[string]struct{})
+
+	for i := range keys {
+		keysMap[keys[i]] = struct{}{}
+	}
+
+	for i := range toKeys {
+		toMap[toKeys[i]] = struct{}{}
+	}
+
+	for k := range keysMap {
+		_, ok := toMap[k]
+		if !ok {
+			c.UI.Warn(fmt.Sprintf("!!! %s was NOT FOUND in the destination\n", k))
+		}
+	}
+
+	// ctx.Done()
+	return nil
 }
 
 func (c *OperatorMigrateCommand) newBackend(kind string, conf map[string]string) (physical.Backend, error) {
@@ -344,6 +447,70 @@ func parseStorage(result *migratorConfig, list *ast.ObjectList, name string) err
 	return nil
 }
 
+func (c *OperatorMigrateCommand) buildKeys(ctx context.Context, source physical.Backend, exclusions, inclusions []string) ([]string, error) {
+	expressions := make([]*regexp.Regexp, 0)
+	for i := range exclusions {
+		expressions = append(expressions, regexp.MustCompile(exclusions[i]))
+	}
+
+	inclusionExpressions := make([]*regexp.Regexp, 0)
+	for i := range inclusions {
+		inclusionExpressions = append(inclusionExpressions, regexp.MustCompile(inclusions[i]))
+	}
+
+	dfs := []string{""}
+
+	mega := make([]string, 0)
+
+	for l := len(dfs); l > 0; l = len(dfs) {
+		key := dfs[len(dfs)-1]
+		if key == "" || strings.HasSuffix(key, "/") {
+			children, err := source.List(ctx, key)
+			if err != nil {
+				return mega, fmt.Errorf("failed to scan for children: %w", err)
+			}
+			sort.Strings(children)
+
+			// remove List-triggering key and add children in reverse order
+			dfs = dfs[:len(dfs)-1]
+			for i := len(children) - 1; i >= 0; i-- {
+				if children[i] != "" {
+					dfs = append(dfs, key+children[i])
+				}
+			}
+		} else {
+			if len(inclusionExpressions) > 0 {
+				for _, exp := range inclusionExpressions {
+					if exp.MatchString(key) {
+						fmt.Println("including", key)
+						mega = append(mega, key)
+					}
+				}
+			} else {
+				skip := false
+				for _, exp := range expressions {
+					if exp.MatchString(key) {
+						skip = true
+					}
+				}
+				if !skip {
+					fmt.Println("not skipping", key)
+					mega = append(mega, key)
+				}
+			}
+			dfs = dfs[:len(dfs)-1]
+		}
+
+		select {
+		case <-ctx.Done():
+			return mega, nil
+		default:
+		}
+	}
+	fmt.Printf("we would return about %v keys\n\n", len(mega))
+	return mega, nil
+}
+
 // dfsScan will invoke cb with every key from source.
 // Keys will be traversed in lexicographic, depth-first order.
 func dfsScan(ctx context.Context, source physical.Backend, cb func(ctx context.Context, path string) error) error {
@@ -370,8 +537,6 @@ func dfsScan(ctx context.Context, source physical.Backend, cb func(ctx context.C
 			if err != nil {
 				return err
 			}
-
-			dfs = dfs[:len(dfs)-1]
 		}
 
 		select {
